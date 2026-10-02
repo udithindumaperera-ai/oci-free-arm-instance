@@ -1,0 +1,107 @@
+name: Try to Create OCI VM
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+env:
+  COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+  IMAGE_ID: ${{ secrets.IMAGE_ID }}
+  SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+  AD_NAME: ${{ secrets.AD_NAME }}
+  OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+  OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+  OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+  OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+  OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup OCI CLI and try to create VM
+        id: create_vm
+        continue-on-error: true
+
+        run: |
+          set -o pipefail
+
+          python -m pip install --upgrade oci-cli
+
+          mkdir -p ~/.oci
+
+          printf '%s\n' "${OCI_CLI_KEY_CONTENT}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_CLI_USER}
+          tenancy=${OCI_CLI_TENANCY}
+          fingerprint=${OCI_CLI_FINGERPRINT}
+          key_file=~/.oci/oci_api_key.pem
+          region=${OCI_CLI_REGION}
+          EOF
+
+          printf '%s\n' "${{ secrets.SSH_PUBLIC_KEY }}" > /home/runner/my_ssh_key.pub
+
+          OCI_OUTPUT=$(oci compute instance launch \
+            --compartment-id "${COMPARTMENT_ID}" \
+            --availability-domain "${AD_NAME}" \
+            --shape "VM.Standard.A1.Flex" \
+            --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+            --subnet-id "${SUBNET_ID}" \
+            --image-id "${IMAGE_ID}" \
+            --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
+            --assign-public-ip true \
+            --display-name "arm-free-vm" \
+            --boot-volume-size-in-gbs 200 \
+            2>&1 || true)
+
+          {
+            echo 'log_data<<EOF'
+            echo "${OCI_OUTPUT}"
+            echo 'EOF'
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "${OCI_OUTPUT}"
+
+          if echo "${OCI_OUTPUT}" | grep -q '"lifecycle-state": "PROVISIONING"'; then
+            echo "VM creation request accepted."
+            exit 0
+          fi
+
+          echo "VM creation did not succeed."
+          exit 1
+
+      - name: Send Discord Notification
+        if: always()
+
+        uses: sarisia/actions-status-discord@v1.15.4
+
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+          title: "OCI VM Status: ${{ steps.create_vm.outcome }}"
+
+          status: ${{ steps.create_vm.outcome }}
+
+          color: ${{ steps.create_vm.outcome == 'success' && '0x28a745' || '0xdc3545' }}
+
+          description: |
+            Attempt to create VM.Standard.A1.Flex
+
+            Configuration:
+            2 OCPU / 12 GB RAM / 200 GB Boot Volume
+
+            Region:
+            ${{ secrets.OCI_CLI_REGION }}
+
+            Status:
+            ${{ steps.create_vm.outcome }}
+
+            Log Output:
+            ```text
+            ${{ steps.create_vm.outputs.log_data }}
+            ```

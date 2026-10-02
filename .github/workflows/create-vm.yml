@@ -1,9 +1,12 @@
-name: Try to Create OCI VM
+name: OCI ARM Auto Claim
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
+
+# Prevent two manual runs from trying to claim at the same time.
+concurrency:
+  group: oci-arm-auto-claim
+  cancel-in-progress: false
 
 env:
   COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
@@ -18,30 +21,36 @@ env:
   OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
 
 jobs:
-  build-and-deploy:
+  auto-claim:
     runs-on: ubuntu-latest
 
     steps:
 
-      # ------------------------------------------------------------
+      # ============================================================
       # 1. Install OCI CLI
-      # ------------------------------------------------------------
+      # ============================================================
       - name: Install OCI CLI
         run: |
+          set -e
+
           python -m pip install --upgrade oci-cli
+
+          echo "OCI CLI version:"
           oci --version
 
 
-      # ------------------------------------------------------------
+      # ============================================================
       # 2. Configure OCI CLI
-      # ------------------------------------------------------------
+      # ============================================================
       - name: Configure OCI CLI
         run: |
           set -e
 
           mkdir -p ~/.oci
 
-          printf '%s\n' "${OCI_CLI_KEY_CONTENT}" > ~/.oci/oci_api_key.pem
+          printf '%s\n' "${OCI_CLI_KEY_CONTENT}" \
+            > ~/.oci/oci_api_key.pem
+
           chmod 600 ~/.oci/oci_api_key.pem
 
           cat > ~/.oci/config <<EOF
@@ -53,370 +62,292 @@ jobs:
           region=${OCI_CLI_REGION}
           EOF
 
-          printf '%s\n' "${{ secrets.SSH_PUBLIC_KEY }}" > /home/runner/my_ssh_key.pub
+          printf '%s\n' "${{ secrets.SSH_PUBLIC_KEY }}" \
+            > /home/runner/my_ssh_key.pub
 
 
-      # ------------------------------------------------------------
-      # 3. Validate OCI resources
-      # ------------------------------------------------------------
+      # ============================================================
+      # 3. One-time validation
+      # ============================================================
       - name: Validate OCI Configuration
-        id: validate
-        continue-on-error: true
         run: |
-          set +e
+          set -e
 
-          LOG_FILE="/tmp/oci-validation.log"
-          : > "$LOG_FILE"
+          echo "========================================"
+          echo "OCI CONFIGURATION CHECK"
+          echo "========================================"
 
-          echo "========================================" | tee -a "$LOG_FILE"
-          echo "OCI CONFIGURATION VALIDATION" | tee -a "$LOG_FILE"
-          echo "========================================" | tee -a "$LOG_FILE"
+          echo "Region: ${OCI_CLI_REGION}"
+          echo "AD: ${AD_NAME}"
+          echo "Shape: VM.Standard.A1.Flex"
+          echo "Target: 2 OCPU / 12 GB / 200 GB"
+          echo ""
 
-          echo "" | tee -a "$LOG_FILE"
-          echo "Region: ${OCI_CLI_REGION}" | tee -a "$LOG_FILE"
-          echo "Shape: VM.Standard.A1.Flex" | tee -a "$LOG_FILE"
-          echo "Target: 2 OCPU / 12 GB / 200 GB" | tee -a "$LOG_FILE"
-
-          # --------------------------------------------------------
-          # USER TEST
-          # --------------------------------------------------------
-          echo "" | tee -a "$LOG_FILE"
-          echo ">>> TEST 1: USER AUTHENTICATION" | tee -a "$LOG_FILE"
+          echo "Checking authentication..."
 
           oci iam user get \
             --user-id "${OCI_CLI_USER}" \
-            --output json > /tmp/user.json 2>&1
+            --output json > /dev/null
 
-          USER_RC=$?
+          echo "✅ Authentication OK"
 
-          if [ $USER_RC -eq 0 ]; then
-            echo "✅ USER: OK" | tee -a "$LOG_FILE"
-          else
-            echo "❌ USER: FAILED" | tee -a "$LOG_FILE"
-            cat /tmp/user.json | tee -a "$LOG_FILE"
-          fi
-
-
-          # --------------------------------------------------------
-          # TENANCY / COMPARTMENT TEST
-          # --------------------------------------------------------
-          echo "" | tee -a "$LOG_FILE"
-          echo ">>> TEST 2: COMPARTMENT" | tee -a "$LOG_FILE"
+          echo "Checking compartment..."
 
           oci iam compartment get \
             --compartment-id "${COMPARTMENT_ID}" \
-            --output json > /tmp/compartment.json 2>&1
+            --output json > /dev/null
 
-          COMPARTMENT_RC=$?
+          echo "✅ Compartment OK"
 
-          if [ $COMPARTMENT_RC -eq 0 ]; then
-            echo "✅ COMPARTMENT: OK" | tee -a "$LOG_FILE"
-          else
-            echo "❌ COMPARTMENT: FAILED" | tee -a "$LOG_FILE"
-            cat /tmp/compartment.json | tee -a "$LOG_FILE"
-          fi
-
-
-          # --------------------------------------------------------
-          # AVAILABILITY DOMAIN TEST
-          # --------------------------------------------------------
-          echo "" | tee -a "$LOG_FILE"
-          echo ">>> TEST 3: AVAILABILITY DOMAIN" | tee -a "$LOG_FILE"
-          echo "Requested AD: ${AD_NAME}" | tee -a "$LOG_FILE"
-
-          oci iam availability-domain list \
-            --compartment-id "${COMPARTMENT_ID}" \
-            --output json > /tmp/ad.json 2>&1
-
-          AD_RC=$?
-
-          if [ $AD_RC -eq 0 ]; then
-
-            AD_FOUND=$(python - <<'PY'
-          import json
-
-          try:
-              with open("/tmp/ad.json", "r") as f:
-                  data = json.load(f)
-
-              requested = "${AD_NAME}"
-
-              found = any(
-                  item.get("name") == requested
-                  for item in data.get("data", [])
-              )
-
-              print("true" if found else "false")
-
-          except Exception:
-              print("false")
-          PY
-          )
-
-            if [ "$AD_FOUND" = "true" ]; then
-              echo "✅ AD: FOUND" | tee -a "$LOG_FILE"
-            else
-              echo "❌ AD: NOT FOUND" | tee -a "$LOG_FILE"
-
-              echo "Available ADs:" | tee -a "$LOG_FILE"
-
-              python - <<'PY' | tee -a "$LOG_FILE"
-          import json
-
-          try:
-              with open("/tmp/ad.json", "r") as f:
-                  data = json.load(f)
-
-              for item in data.get("data", []):
-                  print(item.get("name"))
-
-          except Exception as e:
-              print(e)
-          PY
-            fi
-
-          else
-            echo "❌ AD LIST: FAILED" | tee -a "$LOG_FILE"
-            cat /tmp/ad.json | tee -a "$LOG_FILE"
-          fi
-
-
-          # --------------------------------------------------------
-          # IMAGE TEST
-          # --------------------------------------------------------
-          echo "" | tee -a "$LOG_FILE"
-          echo ">>> TEST 4: IMAGE" | tee -a "$LOG_FILE"
+          echo "Checking image..."
 
           oci compute image get \
             --image-id "${IMAGE_ID}" \
-            --output json > /tmp/image.json 2>&1
+            --output json > /dev/null
 
-          IMAGE_RC=$?
+          echo "✅ Image OK"
 
-          if [ $IMAGE_RC -eq 0 ]; then
-            echo "✅ IMAGE: FOUND" | tee -a "$LOG_FILE"
-
-            python - <<'PY' | tee -a "$LOG_FILE"
-          import json
-
-          try:
-              with open("/tmp/image.json", "r") as f:
-                  data = json.load(f)
-
-              d = data.get("data", {})
-
-              print("Image Name:", d.get("display-name"))
-              print("OS:", d.get("operating-system"))
-              print("OS Version:", d.get("operating-system-version"))
-              print("Architecture:", d.get("architecture"))
-
-          except Exception as e:
-              print("Could not read image details:", e)
-          PY
-
-          else
-            echo "❌ IMAGE: FAILED" | tee -a "$LOG_FILE"
-            cat /tmp/image.json | tee -a "$LOG_FILE"
-          fi
-
-
-          # --------------------------------------------------------
-          # SUBNET TEST
-          # --------------------------------------------------------
-          echo "" | tee -a "$LOG_FILE"
-          echo ">>> TEST 5: SUBNET" | tee -a "$LOG_FILE"
+          echo "Checking subnet..."
 
           oci network subnet get \
             --subnet-id "${SUBNET_ID}" \
-            --output json > /tmp/subnet.json 2>&1
+            --output json > /dev/null
 
-          SUBNET_RC=$?
+          echo "✅ Subnet OK"
 
-          if [ $SUBNET_RC -eq 0 ]; then
-            echo "✅ SUBNET: FOUND" | tee -a "$LOG_FILE"
+          echo "Checking A1 Flex compatibility..."
 
-            python - <<'PY' | tee -a "$LOG_FILE"
-          import json
-
-          try:
-              with open("/tmp/subnet.json", "r") as f:
-                  data = json.load(f)
-
-              d = data.get("data", {})
-
-              print("Subnet Name:", d.get("display-name"))
-              print("CIDR:", d.get("cidr-block"))
-              print("VCN ID:", d.get("vcn-id"))
-              print("Public IP prohibited:", d.get("prohibit-public-ip-on-vnic"))
-
-          except Exception as e:
-              print("Could not read subnet details:", e)
-          PY
-
-          else
-            echo "❌ SUBNET: FAILED" | tee -a "$LOG_FILE"
-            cat /tmp/subnet.json | tee -a "$LOG_FILE"
-          fi
-
-
-          # --------------------------------------------------------
-          # SHAPE + IMAGE COMPATIBILITY TEST
-          # --------------------------------------------------------
-          echo "" | tee -a "$LOG_FILE"
-          echo ">>> TEST 6: A1 FLEX SHAPE + IMAGE COMPATIBILITY" | tee -a "$LOG_FILE"
-
-          oci compute shape list \
+          SHAPES=$(oci compute shape list \
             --compartment-id "${COMPARTMENT_ID}" \
             --availability-domain "${AD_NAME}" \
             --image-id "${IMAGE_ID}" \
             --shape "VM.Standard.A1.Flex" \
-            --output json > /tmp/shapes.json 2>&1
+            --output json)
 
-          SHAPE_RC=$?
+          SHAPE_COUNT=$(python -c '
+          import json,sys
+          data=json.loads(sys.stdin.read())
+          print(len(data.get("data", [])))
+          ' <<< "${SHAPES}")
 
-          if [ $SHAPE_RC -eq 0 ]; then
-            SHAPE_COUNT=$(python - <<'PY'
-          import json
-
-          try:
-              with open("/tmp/shapes.json", "r") as f:
-                  data = json.load(f)
-
-              print(len(data.get("data", [])))
-
-          except Exception:
-              print("0")
-          PY
-          )
-
-            if [ "$SHAPE_COUNT" -gt 0 ]; then
-              echo "✅ SHAPE: VM.Standard.A1.Flex AVAILABLE FOR THIS IMAGE/AD" | tee -a "$LOG_FILE"
-            else
-              echo "❌ SHAPE: VM.Standard.A1.Flex NOT AVAILABLE FOR THIS IMAGE/AD" | tee -a "$LOG_FILE"
-            fi
-
+          if [ "${SHAPE_COUNT}" -gt 0 ]; then
+            echo "✅ VM.Standard.A1.Flex compatible"
           else
-            echo "❌ SHAPE TEST: FAILED" | tee -a "$LOG_FILE"
-            cat /tmp/shapes.json | tee -a "$LOG_FILE"
+            echo "❌ VM.Standard.A1.Flex is not available for this image/AD"
+            exit 1
           fi
 
-
-          # --------------------------------------------------------
-          # FINAL VALIDATION STATUS
-          # --------------------------------------------------------
-          echo "" | tee -a "$LOG_FILE"
-          echo "========================================" | tee -a "$LOG_FILE"
-          echo "VALIDATION COMPLETE" | tee -a "$LOG_FILE"
-          echo "========================================" | tee -a "$LOG_FILE"
-
-          cp "$LOG_FILE" /tmp/validation-final.log
+          echo ""
+          echo "========================================"
+          echo "ALL CONFIGURATION CHECKS PASSED"
+          echo "========================================"
 
 
-      # ------------------------------------------------------------
-      # 4. Try to launch the VM
-      # ------------------------------------------------------------
-      - name: Try to Create VM
-        id: create_vm
-        continue-on-error: true
+      # ============================================================
+      # 4. Auto claim loop
+      # ============================================================
+      - name: Auto Claim ARM VM
+        id: claim
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
         run: |
           set +e
 
-          LOG_FILE="/tmp/oci-create.log"
-          : > "$LOG_FILE"
+          MAX_ATTEMPTS=70
+          RETRY_SECONDS=300
 
-          echo "========================================" | tee -a "$LOG_FILE"
-          echo "OCI ARM VM CREATION ATTEMPT" | tee -a "$LOG_FILE"
-          echo "========================================" | tee -a "$LOG_FILE"
+          send_discord() {
+            local message="$1"
 
-          echo "Region: ${OCI_CLI_REGION}" | tee -a "$LOG_FILE"
-          echo "AD: ${AD_NAME}" | tee -a "$LOG_FILE"
-          echo "Shape: VM.Standard.A1.Flex" | tee -a "$LOG_FILE"
-          echo "OCPU: 2" | tee -a "$LOG_FILE"
-          echo "RAM: 12 GB" | tee -a "$LOG_FILE"
-          echo "Boot Volume: 200 GB" | tee -a "$LOG_FILE"
+            python - "$message" <<'PY' | curl -sS \
+              -H "Content-Type: application/json" \
+              -X POST \
+              --data-binary @- \
+              "${DISCORD_WEBHOOK_URL}" > /dev/null
+          import json
+          import sys
 
-          echo "" | tee -a "$LOG_FILE"
-          echo "Launching VM..." | tee -a "$LOG_FILE"
+          print(json.dumps({
+              "content": sys.argv[1]
+          }))
+          PY
+          }
 
-          OCI_OUTPUT=$(oci compute instance launch \
-            --compartment-id "${COMPARTMENT_ID}" \
-            --availability-domain "${AD_NAME}" \
-            --shape "VM.Standard.A1.Flex" \
-            --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-            --subnet-id "${SUBNET_ID}" \
-            --image-id "${IMAGE_ID}" \
-            --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
-            --assign-public-ip true \
-            --display-name "arm-free-vm" \
-            --boot-volume-size-in-gbs 200 \
-            --output json \
-            2>&1)
+          echo "========================================"
+          echo "OCI ARM AUTO CLAIM STARTED"
+          echo "========================================"
+          echo ""
+          echo "Region: ${OCI_CLI_REGION}"
+          echo "AD: ${AD_NAME}"
+          echo "Shape: VM.Standard.A1.Flex"
+          echo "OCPU: 2"
+          echo "RAM: 12 GB"
+          echo "Boot Volume: 200 GB"
+          echo "Retry interval: ${RETRY_SECONDS} seconds"
+          echo "Maximum attempts: ${MAX_ATTEMPTS}"
+          echo ""
 
-          OCI_RC=$?
+          send_discord \
+            "🚀 OCI ARM auto-claim started | ${OCI_CLI_REGION} | 2 OCPU / 12 GB / 200 GB"
 
-          echo "${OCI_OUTPUT}" | tee -a "$LOG_FILE"
+          for ((attempt=1; attempt<=MAX_ATTEMPTS; attempt++)); do
 
-          echo "" | tee -a "$LOG_FILE"
-          echo "OCI exit code: ${OCI_RC}" | tee -a "$LOG_FILE"
+            echo ""
+            echo "========================================"
+            echo "ATTEMPT ${attempt}/${MAX_ATTEMPTS}"
+            echo "========================================"
 
-          {
-            echo 'log_data<<EOF'
-            cat "$LOG_FILE"
-            echo 'EOF'
-          } >> "${GITHUB_OUTPUT}"
+            START_TIME=$(date '+%Y-%m-%d %H:%M:%S UTC')
 
-          if [ $OCI_RC -eq 0 ] && echo "${OCI_OUTPUT}" | grep -q '"lifecycle-state": "PROVISIONING"'; then
+            OCI_OUTPUT=$(oci compute instance launch \
+              --compartment-id "${COMPARTMENT_ID}" \
+              --availability-domain "${AD_NAME}" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+              --subnet-id "${SUBNET_ID}" \
+              --image-id "${IMAGE_ID}" \
+              --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
+              --assign-public-ip true \
+              --display-name "arm-free-vm" \
+              --boot-volume-size-in-gbs 200 \
+              --output json \
+              2>&1)
 
-            echo "✅ SUCCESS: VM creation request accepted." | tee -a "$LOG_FILE"
+            OCI_RC=$?
 
-            echo "success=true" >> "${GITHUB_OUTPUT}"
+            echo "${OCI_OUTPUT}"
 
-            exit 0
+            # ------------------------------------------------------
+            # SUCCESS
+            # ------------------------------------------------------
+            if [ "${OCI_RC}" -eq 0 ]; then
 
-          fi
+              INSTANCE_ID=$(python - <<'PY' <<< "${OCI_OUTPUT}"
+          import json
+          import sys
 
-          echo "❌ VM creation failed." | tee -a "$LOG_FILE"
+          try:
+              data = json.loads(sys.stdin.read()).get("data", {})
+              state = data.get("lifecycle-state", "")
+              instance_id = data.get("id", "")
 
-          echo "success=false" >> "${GITHUB_OUTPUT}"
+              if state in ["PROVISIONING", "RUNNING"]:
+                  print(instance_id)
 
+          except Exception:
+              pass
+          PY
+              )
+
+              if [ -n "${INSTANCE_ID}" ]; then
+
+                echo ""
+                echo "========================================"
+                echo "✅ VM CREATED SUCCESSFULLY"
+                echo "========================================"
+                echo "Instance ID:"
+                echo "${INSTANCE_ID}"
+
+                send_discord \
+                  "✅ OCI ARM VM CREATED! | Region: ${OCI_CLI_REGION} | 2 OCPU | 12 GB RAM | 200 GB | Instance: ${INSTANCE_ID}"
+
+                echo "vm_created=true" >> "${GITHUB_OUTPUT}"
+                echo "instance_id=${INSTANCE_ID}" >> "${GITHUB_OUTPUT}"
+
+                exit 0
+              fi
+
+            fi
+
+
+            # ------------------------------------------------------
+            # CAPACITY ERROR
+            # ------------------------------------------------------
+            if echo "${OCI_OUTPUT}" | grep -qi "Out of host capacity"; then
+
+              echo ""
+              echo "⚠️ Out of host capacity."
+
+              send_discord \
+                "⏳ OCI ARM attempt ${attempt}/${MAX_ATTEMPTS}: Out of host capacity. Retrying in 5 minutes."
+
+              if [ "${attempt}" -lt "${MAX_ATTEMPTS}" ]; then
+                echo "Sleeping for ${RETRY_SECONDS} seconds..."
+                sleep "${RETRY_SECONDS}"
+                continue
+              fi
+
+            fi
+
+
+            # ------------------------------------------------------
+            # OTHER ERROR
+            # ------------------------------------------------------
+            echo ""
+            echo "❌ Non-capacity error detected."
+
+            ERROR_MESSAGE=$(python - <<'PY' <<< "${OCI_OUTPUT}"
+          import json
+          import sys
+
+          raw = sys.stdin.read()
+
+          try:
+              data = json.loads(raw)
+              print(
+                  data.get("message")
+                  or data.get("error")
+                  or "Unknown OCI error"
+              )
+          except Exception:
+              print(raw[:500])
+          PY
+            )
+
+            send_discord \
+              "❌ OCI ARM claim stopped. Attempt ${attempt}. Error: ${ERROR_MESSAGE}"
+
+            echo ""
+            echo "========================================"
+            echo "WORKFLOW STOPPED"
+            echo "========================================"
+
+            exit 1
+
+          done
+
+
+          # ========================================================
+          # Maximum attempts reached
+          # ========================================================
+          echo ""
+          echo "========================================"
+          echo "⏰ MAXIMUM ATTEMPTS REACHED"
+          echo "========================================"
+
+          send_discord \
+            "⏰ OCI ARM auto-claim ended after ${MAX_ATTEMPTS} attempts without capacity."
+
+          echo "vm_created=false" >> "${GITHUB_OUTPUT}"
           exit 1
 
 
-      # ------------------------------------------------------------
-      # 5. Discord notification
-      # ------------------------------------------------------------
-      - name: Send Discord Notification
+      # ============================================================
+      # 5. Final GitHub summary
+      # ============================================================
+      - name: Final Status
         if: always()
-        uses: sarisia/actions-status-discord@v1.15.4
+        run: |
+          echo "========================================"
+          echo "OCI ARM AUTO CLAIM FINISHED"
+          echo "========================================"
 
-        with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
-
-          title: "OCI ARM VM: ${{ steps.create_vm.outcome }}"
-
-          status: ${{ steps.create_vm.outcome }}
-
-          color: ${{ steps.create_vm.outcome == 'success' && '0x28a745' || '0xdc3545' }}
-
-          description: |
-            OCI ARM VM attempt
-
-            Configuration:
-            2 OCPU
-            12 GB RAM
-            200 GB Boot Volume
-
-            Region:
-            ${{ secrets.OCI_CLI_REGION }}
-
-            Availability Domain:
-            ${{ secrets.AD_NAME }}
-
-            Status:
-            ${{ steps.create_vm.outcome }}
-
-            Full diagnostic / creation log:
-
-            ```text
-            ${{ steps.create_vm.outputs.log_data }}
-            ```
+          if [ "${{ steps.claim.outputs.vm_created }}" = "true" ]; then
+            echo "✅ VM successfully created."
+            echo ""
+            echo "Instance ID:"
+            echo "${{ steps.claim.outputs.instance_id }}"
+          else
+            echo "❌ VM was not created."
+          fi

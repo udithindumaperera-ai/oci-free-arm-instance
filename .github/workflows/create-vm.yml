@@ -1,12 +1,17 @@
 name: OCI ARM Auto Claim
 
 on:
+  schedule:
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
-# Prevent two manual runs from trying to claim at the same time.
 concurrency:
   group: oci-arm-auto-claim
   cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
 
 env:
   COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
@@ -21,27 +26,28 @@ env:
   OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
 
 jobs:
-  auto-claim:
+  claim:
     runs-on: ubuntu-latest
+    timeout-minutes: 4
 
     steps:
 
-      # ============================================================
+      # ==========================================================
       # 1. Install OCI CLI
-      # ============================================================
+      # ==========================================================
       - name: Install OCI CLI
         run: |
           set -e
 
           python -m pip install --upgrade oci-cli
 
-          echo "OCI CLI version:"
+          echo "OCI CLI:"
           oci --version
 
 
-      # ============================================================
+      # ==========================================================
       # 2. Configure OCI CLI
-      # ============================================================
+      # ==========================================================
       - name: Configure OCI CLI
         run: |
           set -e
@@ -66,288 +72,170 @@ jobs:
             > /home/runner/my_ssh_key.pub
 
 
-      # ============================================================
-      # 3. One-time validation
-      # ============================================================
-      - name: Validate OCI Configuration
-        run: |
-          set -e
-
-          echo "========================================"
-          echo "OCI CONFIGURATION CHECK"
-          echo "========================================"
-
-          echo "Region: ${OCI_CLI_REGION}"
-          echo "AD: ${AD_NAME}"
-          echo "Shape: VM.Standard.A1.Flex"
-          echo "Target: 2 OCPU / 12 GB / 200 GB"
-          echo ""
-
-          echo "Checking authentication..."
-
-          oci iam user get \
-            --user-id "${OCI_CLI_USER}" \
-            --output json > /dev/null
-
-          echo "✅ Authentication OK"
-
-          echo "Checking compartment..."
-
-          oci iam compartment get \
-            --compartment-id "${COMPARTMENT_ID}" \
-            --output json > /dev/null
-
-          echo "✅ Compartment OK"
-
-          echo "Checking image..."
-
-          oci compute image get \
-            --image-id "${IMAGE_ID}" \
-            --output json > /dev/null
-
-          echo "✅ Image OK"
-
-          echo "Checking subnet..."
-
-          oci network subnet get \
-            --subnet-id "${SUBNET_ID}" \
-            --output json > /dev/null
-
-          echo "✅ Subnet OK"
-
-          echo "Checking A1 Flex compatibility..."
-
-          SHAPES=$(oci compute shape list \
-            --compartment-id "${COMPARTMENT_ID}" \
-            --availability-domain "${AD_NAME}" \
-            --image-id "${IMAGE_ID}" \
-            --shape "VM.Standard.A1.Flex" \
-            --output json)
-
-          SHAPE_COUNT=$(python -c '
-          import json,sys
-          data=json.loads(sys.stdin.read())
-          print(len(data.get("data", [])))
-          ' <<< "${SHAPES}")
-
-          if [ "${SHAPE_COUNT}" -gt 0 ]; then
-            echo "✅ VM.Standard.A1.Flex compatible"
-          else
-            echo "❌ VM.Standard.A1.Flex is not available for this image/AD"
-            exit 1
-          fi
-
-          echo ""
-          echo "========================================"
-          echo "ALL CONFIGURATION CHECKS PASSED"
-          echo "========================================"
-
-
-      # ============================================================
-      # 4. Auto claim loop
-      # ============================================================
-      - name: Auto Claim ARM VM
-        id: claim
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      # ==========================================================
+      # 3. Try to create the VM
+      # ==========================================================
+      - name: Try to Create ARM VM
+        id: create_vm
+        continue-on-error: true
 
         run: |
           set +e
 
-          MAX_ATTEMPTS=70
-          RETRY_SECONDS=300
+          LOG_FILE="/tmp/oci-result.log"
+          : > "$LOG_FILE"
 
-          send_discord() {
-            local message="$1"
+          echo "========================================" | tee -a "$LOG_FILE"
+          echo "OCI ARM AUTO CLAIM ATTEMPT" | tee -a "$LOG_FILE"
+          echo "========================================" | tee -a "$LOG_FILE"
 
-            python - "$message" <<'PY' | curl -sS \
-              -H "Content-Type: application/json" \
-              -X POST \
-              --data-binary @- \
-              "${DISCORD_WEBHOOK_URL}" > /dev/null
-          import json
-          import sys
+          echo "Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" | tee -a "$LOG_FILE"
+          echo "Region: ${OCI_CLI_REGION}" | tee -a "$LOG_FILE"
+          echo "AD: ${AD_NAME}" | tee -a "$LOG_FILE"
+          echo "Shape: VM.Standard.A1.Flex" | tee -a "$LOG_FILE"
+          echo "OCPU: 2" | tee -a "$LOG_FILE"
+          echo "RAM: 12 GB" | tee -a "$LOG_FILE"
+          echo "Boot Volume: 200 GB" | tee -a "$LOG_FILE"
 
-          print(json.dumps({
-              "content": sys.argv[1]
-          }))
-          PY
-          }
+          echo "" | tee -a "$LOG_FILE"
+          echo "Launching VM..." | tee -a "$LOG_FILE"
 
-          echo "========================================"
-          echo "OCI ARM AUTO CLAIM STARTED"
-          echo "========================================"
-          echo ""
-          echo "Region: ${OCI_CLI_REGION}"
-          echo "AD: ${AD_NAME}"
-          echo "Shape: VM.Standard.A1.Flex"
-          echo "OCPU: 2"
-          echo "RAM: 12 GB"
-          echo "Boot Volume: 200 GB"
-          echo "Retry interval: ${RETRY_SECONDS} seconds"
-          echo "Maximum attempts: ${MAX_ATTEMPTS}"
-          echo ""
+          OCI_OUTPUT=$(oci compute instance launch \
+            --compartment-id "${COMPARTMENT_ID}" \
+            --availability-domain "${AD_NAME}" \
+            --shape "VM.Standard.A1.Flex" \
+            --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+            --subnet-id "${SUBNET_ID}" \
+            --image-id "${IMAGE_ID}" \
+            --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
+            --assign-public-ip true \
+            --display-name "arm-free-vm" \
+            --boot-volume-size-in-gbs 200 \
+            --output json \
+            2>&1)
 
-          send_discord \
-            "🚀 OCI ARM auto-claim started | ${OCI_CLI_REGION} | 2 OCPU / 12 GB / 200 GB"
+          OCI_RC=$?
 
-          for ((attempt=1; attempt<=MAX_ATTEMPTS; attempt++)); do
+          echo "" | tee -a "$LOG_FILE"
+          echo "${OCI_OUTPUT}" | tee -a "$LOG_FILE"
+          echo "" | tee -a "$LOG_FILE"
+          echo "OCI exit code: ${OCI_RC}" | tee -a "$LOG_FILE"
 
-            echo ""
-            echo "========================================"
-            echo "ATTEMPT ${attempt}/${MAX_ATTEMPTS}"
-            echo "========================================"
+          # ------------------------------------------------------
+          # SUCCESS
+          # ------------------------------------------------------
+          if [ "${OCI_RC}" -eq 0 ]; then
 
-            START_TIME=$(date '+%Y-%m-%d %H:%M:%S UTC')
-
-            OCI_OUTPUT=$(oci compute instance launch \
-              --compartment-id "${COMPARTMENT_ID}" \
-              --availability-domain "${AD_NAME}" \
-              --shape "VM.Standard.A1.Flex" \
-              --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-              --subnet-id "${SUBNET_ID}" \
-              --image-id "${IMAGE_ID}" \
-              --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
-              --assign-public-ip true \
-              --display-name "arm-free-vm" \
-              --boot-volume-size-in-gbs 200 \
-              --output json \
-              2>&1)
-
-            OCI_RC=$?
-
-            echo "${OCI_OUTPUT}"
-
-            # ------------------------------------------------------
-            # SUCCESS
-            # ------------------------------------------------------
-            if [ "${OCI_RC}" -eq 0 ]; then
-
-              INSTANCE_ID=$(python - <<'PY' <<< "${OCI_OUTPUT}"
+            INSTANCE_ID=$(python - <<'PY' <<< "${OCI_OUTPUT}"
           import json
           import sys
 
           try:
               data = json.loads(sys.stdin.read()).get("data", {})
-              state = data.get("lifecycle-state", "")
-              instance_id = data.get("id", "")
-
-              if state in ["PROVISIONING", "RUNNING"]:
-                  print(instance_id)
-
+              print(data.get("id", ""))
           except Exception:
-              pass
-          PY
-              )
-
-              if [ -n "${INSTANCE_ID}" ]; then
-
-                echo ""
-                echo "========================================"
-                echo "✅ VM CREATED SUCCESSFULLY"
-                echo "========================================"
-                echo "Instance ID:"
-                echo "${INSTANCE_ID}"
-
-                send_discord \
-                  "✅ OCI ARM VM CREATED! | Region: ${OCI_CLI_REGION} | 2 OCPU | 12 GB RAM | 200 GB | Instance: ${INSTANCE_ID}"
-
-                echo "vm_created=true" >> "${GITHUB_OUTPUT}"
-                echo "instance_id=${INSTANCE_ID}" >> "${GITHUB_OUTPUT}"
-
-                exit 0
-              fi
-
-            fi
-
-
-            # ------------------------------------------------------
-            # CAPACITY ERROR
-            # ------------------------------------------------------
-            if echo "${OCI_OUTPUT}" | grep -qi "Out of host capacity"; then
-
-              echo ""
-              echo "⚠️ Out of host capacity."
-
-              send_discord \
-                "⏳ OCI ARM attempt ${attempt}/${MAX_ATTEMPTS}: Out of host capacity. Retrying in 5 minutes."
-
-              if [ "${attempt}" -lt "${MAX_ATTEMPTS}" ]; then
-                echo "Sleeping for ${RETRY_SECONDS} seconds..."
-                sleep "${RETRY_SECONDS}"
-                continue
-              fi
-
-            fi
-
-
-            # ------------------------------------------------------
-            # OTHER ERROR
-            # ------------------------------------------------------
-            echo ""
-            echo "❌ Non-capacity error detected."
-
-            ERROR_MESSAGE=$(python - <<'PY' <<< "${OCI_OUTPUT}"
-          import json
-          import sys
-
-          raw = sys.stdin.read()
-
-          try:
-              data = json.loads(raw)
-              print(
-                  data.get("message")
-                  or data.get("error")
-                  or "Unknown OCI error"
-              )
-          except Exception:
-              print(raw[:500])
+              print("")
           PY
             )
 
-            send_discord \
-              "❌ OCI ARM claim stopped. Attempt ${attempt}. Error: ${ERROR_MESSAGE}"
+            echo "" | tee -a "$LOG_FILE"
+            echo "✅ VM CREATION REQUEST ACCEPTED" | tee -a "$LOG_FILE"
+            echo "Instance ID: ${INSTANCE_ID}" | tee -a "$LOG_FILE"
 
-            echo ""
-            echo "========================================"
-            echo "WORKFLOW STOPPED"
-            echo "========================================"
+            echo "result=success" >> "${GITHUB_OUTPUT}"
+            echo "instance_id=${INSTANCE_ID}" >> "${GITHUB_OUTPUT}"
 
-            exit 1
-
-          done
+            exit 0
+          fi
 
 
-          # ========================================================
-          # Maximum attempts reached
-          # ========================================================
-          echo ""
-          echo "========================================"
-          echo "⏰ MAXIMUM ATTEMPTS REACHED"
-          echo "========================================"
+          # ------------------------------------------------------
+          # OUT OF CAPACITY
+          # ------------------------------------------------------
+          if echo "${OCI_OUTPUT}" | grep -qi "Out of host capacity"; then
 
-          send_discord \
-            "⏰ OCI ARM auto-claim ended after ${MAX_ATTEMPTS} attempts without capacity."
+            echo "" | tee -a "$LOG_FILE"
+            echo "⏳ OUT OF HOST CAPACITY" | tee -a "$LOG_FILE"
+            echo "Next scheduled attempt will try again." | tee -a "$LOG_FILE"
 
-          echo "vm_created=false" >> "${GITHUB_OUTPUT}"
+            echo "result=capacity" >> "${GITHUB_OUTPUT}"
+
+            exit 0
+          fi
+
+
+          # ------------------------------------------------------
+          # OTHER ERROR
+          # ------------------------------------------------------
+          echo "" | tee -a "$LOG_FILE"
+          echo "❌ OCI ERROR" | tee -a "$LOG_FILE"
+
+          echo "result=error" >> "${GITHUB_OUTPUT}"
+
           exit 1
 
 
-      # ============================================================
-      # 5. Final GitHub summary
-      # ============================================================
-      - name: Final Status
+      # ==========================================================
+      # 4. Discord notification
+      # ==========================================================
+      - name: Send Discord Notification
         if: always()
-        run: |
-          echo "========================================"
-          echo "OCI ARM AUTO CLAIM FINISHED"
-          echo "========================================"
+        continue-on-error: true
 
-          if [ "${{ steps.claim.outputs.vm_created }}" = "true" ]; then
-            echo "✅ VM successfully created."
-            echo ""
-            echo "Instance ID:"
-            echo "${{ steps.claim.outputs.instance_id }}"
-          else
-            echo "❌ VM was not created."
-          fi
+        uses: sarisia/actions-status-discord@v1.15.4
+
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+          title: >-
+            OCI ARM:
+            ${{ steps.create_vm.outputs.result || 'error' }}
+
+          status: >-
+            ${{ steps.create_vm.outputs.result == 'success'
+              && 'success'
+              || steps.create_vm.outputs.result == 'capacity'
+              && 'neutral'
+              || 'failure' }}
+
+          color: >-
+            ${{ steps.create_vm.outputs.result == 'success'
+              && '0x28a745'
+              || steps.create_vm.outputs.result == 'capacity'
+              && '0xffc107'
+              || '0xdc3545' }}
+
+          description: |
+            OCI ARM Auto Claim
+
+            Region:
+            ${{ secrets.OCI_CLI_REGION }}
+
+            Configuration:
+            2 OCPU / 12 GB RAM / 200 GB Boot
+
+            Result:
+            ${{ steps.create_vm.outputs.result }}
+
+            Instance ID:
+            ${{ steps.create_vm.outputs.instance_id }}
+
+
+      # ==========================================================
+      # 5. Disable workflow automatically after successful claim
+      # ==========================================================
+      - name: Disable Workflow After Success
+        if: steps.create_vm.outputs.result == 'success'
+
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+        run: |
+          echo "VM was created successfully."
+          echo "Disabling this workflow..."
+
+          gh workflow disable \
+            "${{ github.workflow }}" \
+            --repo "${{ github.repository }}"
+
+          echo "✅ Workflow disabled."

@@ -1,17 +1,15 @@
 name: OCI ARM Auto Claim
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
-
-concurrency:
-  group: oci-arm-auto-claim
-  cancel-in-progress: false
 
 permissions:
   actions: write
   contents: read
+
+concurrency:
+  group: oci-arm-auto-claim
+  cancel-in-progress: false
 
 env:
   COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
@@ -28,7 +26,7 @@ env:
 jobs:
   claim:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 10
 
     steps:
 
@@ -41,7 +39,7 @@ jobs:
 
           python -m pip install --upgrade oci-cli
 
-          echo "OCI CLI:"
+          echo "OCI CLI version:"
           oci --version
 
 
@@ -73,32 +71,152 @@ jobs:
 
 
       # ==========================================================
-      # 3. Try to create the VM
+      # 3. Check that OCI credentials/resources still work
+      # ==========================================================
+      - name: Validate OCI Configuration
+        run: |
+          set -e
+
+          echo "========================================"
+          echo "OCI CONFIGURATION CHECK"
+          echo "========================================"
+
+          echo "Region: ${OCI_CLI_REGION}"
+          echo "AD: ${AD_NAME}"
+          echo "Shape: VM.Standard.A1.Flex"
+          echo "OCPU: 2"
+          echo "RAM: 12 GB"
+          echo "Boot Volume: 200 GB"
+          echo ""
+
+          echo "Checking authentication..."
+
+          oci iam user get \
+            --user-id "${OCI_CLI_USER}" \
+            --output json > /dev/null
+
+          echo "✅ Authentication OK"
+
+          echo "Checking compartment..."
+
+          oci iam compartment get \
+            --compartment-id "${COMPARTMENT_ID}" \
+            --output json > /dev/null
+
+          echo "✅ Compartment OK"
+
+          echo "Checking image..."
+
+          oci compute image get \
+            --image-id "${IMAGE_ID}" \
+            --output json > /dev/null
+
+          echo "✅ Image OK"
+
+          echo "Checking subnet..."
+
+          oci network subnet get \
+            --subnet-id "${SUBNET_ID}" \
+            --output json > /dev/null
+
+          echo "✅ Subnet OK"
+
+          echo ""
+          echo "✅ All OCI configuration checks passed."
+
+
+      # ==========================================================
+      # 4. Check whether a VM already exists
+      # ==========================================================
+      - name: Check Existing VM
+        id: existing
+        run: |
+          set -e
+
+          echo "Checking for existing arm-free-vm..."
+
+          INSTANCE_LIST=$(oci compute instance list \
+            --compartment-id "${COMPARTMENT_ID}" \
+            --all \
+            --output json)
+
+          INSTANCE_ID=$(printf '%s' "${INSTANCE_LIST}" | python -c '
+          import json
+          import sys
+
+          data = json.load(sys.stdin)
+
+          for item in data.get("data", []):
+              if item.get("display-name") == "arm-free-vm":
+                  state = item.get("lifecycle-state", "")
+                  if state not in ("TERMINATED", "TERMINATING"):
+                      print(item.get("id", ""))
+                      break
+          ')
+
+          if [ -n "${INSTANCE_ID}" ]; then
+            echo "✅ Existing VM found:"
+            echo "${INSTANCE_ID}"
+
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+            echo "instance_id=${INSTANCE_ID}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "No existing VM found."
+
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+
+      # ==========================================================
+      # 5. Finish if a VM already exists
+      # ==========================================================
+      - name: Finish Existing VM
+        if: steps.existing.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+        run: |
+          echo "========================================"
+          echo "✅ VM ALREADY EXISTS"
+          echo "========================================"
+
+          echo "Instance ID:"
+          echo "${{ steps.existing.outputs.instance_id }}"
+
+          echo ""
+          echo "No new VM will be created."
+
+          gh workflow disable \
+            "create-vm.yml" \
+            --repo "${{ github.repository }}" || true
+
+
+      # ==========================================================
+      # 6. Try to create the VM
       # ==========================================================
       - name: Try to Create ARM VM
         id: create_vm
-        continue-on-error: true
-
+        if: steps.existing.outputs.exists != 'true'
         run: |
           set +e
 
-          LOG_FILE="/tmp/oci-result.log"
-          : > "$LOG_FILE"
+          echo "========================================"
+          echo "OCI ARM AUTO CLAIM ATTEMPT"
+          echo "========================================"
 
-          echo "========================================" | tee -a "$LOG_FILE"
-          echo "OCI ARM AUTO CLAIM ATTEMPT" | tee -a "$LOG_FILE"
-          echo "========================================" | tee -a "$LOG_FILE"
+          echo "Time:"
+          date -u '+%Y-%m-%d %H:%M:%S UTC'
 
-          echo "Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" | tee -a "$LOG_FILE"
-          echo "Region: ${OCI_CLI_REGION}" | tee -a "$LOG_FILE"
-          echo "AD: ${AD_NAME}" | tee -a "$LOG_FILE"
-          echo "Shape: VM.Standard.A1.Flex" | tee -a "$LOG_FILE"
-          echo "OCPU: 2" | tee -a "$LOG_FILE"
-          echo "RAM: 12 GB" | tee -a "$LOG_FILE"
-          echo "Boot Volume: 200 GB" | tee -a "$LOG_FILE"
+          echo ""
+          echo "Region: ${OCI_CLI_REGION}"
+          echo "AD: ${AD_NAME}"
+          echo "Shape: VM.Standard.A1.Flex"
+          echo "OCPU: 2"
+          echo "RAM: 12 GB"
+          echo "Boot Volume: 200 GB"
 
-          echo "" | tee -a "$LOG_FILE"
-          echo "Launching VM..." | tee -a "$LOG_FILE"
+          echo ""
+          echo "Launching VM..."
 
           OCI_OUTPUT=$(oci compute instance launch \
             --compartment-id "${COMPARTMENT_ID}" \
@@ -116,126 +234,189 @@ jobs:
 
           OCI_RC=$?
 
-          echo "" | tee -a "$LOG_FILE"
-          echo "${OCI_OUTPUT}" | tee -a "$LOG_FILE"
-          echo "" | tee -a "$LOG_FILE"
-          echo "OCI exit code: ${OCI_RC}" | tee -a "$LOG_FILE"
+          echo ""
+          echo "OCI exit code: ${OCI_RC}"
+          echo ""
 
-          # ------------------------------------------------------
+          echo "${OCI_OUTPUT}"
+
+          # -------------------------------------------------------
           # SUCCESS
-          # ------------------------------------------------------
+          # -------------------------------------------------------
           if [ "${OCI_RC}" -eq 0 ]; then
 
-            INSTANCE_ID=$(python - <<'PY' <<< "${OCI_OUTPUT}"
+            INSTANCE_ID=$(printf '%s' "${OCI_OUTPUT}" | python -c '
           import json
           import sys
 
           try:
-              data = json.loads(sys.stdin.read()).get("data", {})
-              print(data.get("id", ""))
+              data = json.load(sys.stdin)
+              print(data.get("data", {}).get("id", ""))
           except Exception:
               print("")
-          PY
-            )
+          ')
 
-            echo "" | tee -a "$LOG_FILE"
-            echo "✅ VM CREATION REQUEST ACCEPTED" | tee -a "$LOG_FILE"
-            echo "Instance ID: ${INSTANCE_ID}" | tee -a "$LOG_FILE"
+            if [ -n "${INSTANCE_ID}" ]; then
 
-            echo "result=success" >> "${GITHUB_OUTPUT}"
-            echo "instance_id=${INSTANCE_ID}" >> "${GITHUB_OUTPUT}"
+              echo "result=success" >> "${GITHUB_OUTPUT}"
+              echo "instance_id=${INSTANCE_ID}" >> "${GITHUB_OUTPUT}"
 
-            exit 0
+              echo ""
+              echo "========================================"
+              echo "✅ VM CREATION SUCCESSFUL"
+              echo "========================================"
+              echo "Instance ID:"
+              echo "${INSTANCE_ID}"
+
+              exit 0
+            fi
           fi
 
 
-          # ------------------------------------------------------
-          # OUT OF CAPACITY
-          # ------------------------------------------------------
+          # -------------------------------------------------------
+          # OUT OF HOST CAPACITY
+          # -------------------------------------------------------
           if echo "${OCI_OUTPUT}" | grep -qi "Out of host capacity"; then
-
-            echo "" | tee -a "$LOG_FILE"
-            echo "⏳ OUT OF HOST CAPACITY" | tee -a "$LOG_FILE"
-            echo "Next scheduled attempt will try again." | tee -a "$LOG_FILE"
 
             echo "result=capacity" >> "${GITHUB_OUTPUT}"
 
+            echo ""
+            echo "========================================"
+            echo "⏳ OUT OF HOST CAPACITY"
+            echo "========================================"
+
             exit 0
           fi
 
 
-          # ------------------------------------------------------
+          # -------------------------------------------------------
           # OTHER ERROR
-          # ------------------------------------------------------
-          echo "" | tee -a "$LOG_FILE"
-          echo "❌ OCI ERROR" | tee -a "$LOG_FILE"
-
+          # -------------------------------------------------------
           echo "result=error" >> "${GITHUB_OUTPUT}"
+
+          echo ""
+          echo "========================================"
+          echo "❌ NON-CAPACITY OCI ERROR"
+          echo "========================================"
 
           exit 1
 
 
       # ==========================================================
-      # 4. Discord notification
+      # 7. Discord notification
       # ==========================================================
-      - name: Send Discord Notification
+      - name: Discord Notification
         if: always()
-        continue-on-error: true
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RESULT: ${{ steps.create_vm.outputs.result }}
+          INSTANCE_ID: ${{ steps.create_vm.outputs.instance_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set +e
 
-        uses: sarisia/actions-status-discord@v1.15.4
+          if [ "${RESULT}" = "success" ]; then
 
-        with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+            MESSAGE="✅ **OCI ARM VM CREATED!**
 
-          title: >-
-            OCI ARM:
-            ${{ steps.create_vm.outputs.result || 'error' }}
+          Region: \`${OCI_CLI_REGION}\`
+          Shape: \`VM.Standard.A1.Flex\`
+          CPU: \`2 OCPU\`
+          RAM: \`12 GB\`
+          Boot Volume: \`200 GB\`
 
-          status: >-
-            ${{ steps.create_vm.outputs.result == 'success'
-              && 'success'
-              || steps.create_vm.outputs.result == 'capacity'
-              && 'neutral'
-              || 'failure' }}
+          Instance ID:
+          \`${INSTANCE_ID}\`"
 
-          color: >-
-            ${{ steps.create_vm.outputs.result == 'success'
-              && '0x28a745'
-              || steps.create_vm.outputs.result == 'capacity'
-              && '0xffc107'
-              || '0xdc3545' }}
+          elif [ "${RESULT}" = "capacity" ]; then
 
-          description: |
-            OCI ARM Auto Claim
+            MESSAGE="⏳ **OCI ARM attempt #${RUN_NUMBER}**
 
-            Region:
-            ${{ secrets.OCI_CLI_REGION }}
+          Out of host capacity.
 
-            Configuration:
-            2 OCPU / 12 GB RAM / 200 GB Boot
+          Region: \`${OCI_CLI_REGION}\`
+          Target: \`2 OCPU / 12 GB / 200 GB\`
 
-            Result:
-            ${{ steps.create_vm.outputs.result }}
+          Next attempt will start automatically in about 5 minutes."
 
-            Instance ID:
-            ${{ steps.create_vm.outputs.instance_id }}
+          else
+
+            MESSAGE="❌ **OCI ARM claim failed**
+
+          A non-capacity OCI error occurred.
+
+          Check the GitHub Actions log for details."
+
+          fi
+
+          python - "${MESSAGE}" <<'PY' > /tmp/discord.json
+          import json
+          import sys
+
+          print(json.dumps({
+              "content": sys.argv[1]
+          }))
+          PY
+
+          curl -sS \
+            -H "Content-Type: application/json" \
+            -X POST \
+            --data-binary @/tmp/discord.json \
+            "${WEBHOOK}" \
+            >/dev/null 2>&1 || true
 
 
       # ==========================================================
-      # 5. Disable workflow automatically after successful claim
+      # 8. Success -> stop the chain
       # ==========================================================
-      - name: Disable Workflow After Success
+      - name: Stop After Success
         if: steps.create_vm.outputs.result == 'success'
-
         env:
           GH_TOKEN: ${{ github.token }}
 
         run: |
-          echo "VM was created successfully."
-          echo "Disabling this workflow..."
+          echo "========================================"
+          echo "✅ CLAIM COMPLETE"
+          echo "========================================"
+
+          echo "Instance ID:"
+          echo "${{ steps.create_vm.outputs.instance_id }}"
+
+          echo ""
+          echo "Disabling workflow so no more attempts are made."
 
           gh workflow disable \
-            "${{ github.workflow }}" \
+            "create-vm.yml" \
             --repo "${{ github.repository }}"
 
           echo "✅ Workflow disabled."
+
+
+      # ==========================================================
+      # 9. Capacity -> wait 5 min -> start another workflow run
+      # ==========================================================
+      - name: Retry After Capacity
+        if: steps.create_vm.outputs.result == 'capacity'
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+        run: |
+          set -e
+
+          echo "========================================"
+          echo "⏳ CAPACITY RETRY"
+          echo "========================================"
+
+          echo "Waiting 5 minutes..."
+          sleep 300
+
+          echo ""
+          echo "Starting the next workflow run..."
+
+          gh workflow run \
+            "create-vm.yml" \
+            --repo "${{ github.repository }}" \
+            --ref main
+
+          echo ""
+          echo "✅ Next attempt dispatched."

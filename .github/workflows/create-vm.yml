@@ -10,6 +10,7 @@ env:
   IMAGE_ID: ${{ secrets.IMAGE_ID }}
   SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
   AD_NAME: ${{ secrets.AD_NAME }}
+
   OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
   OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
   OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
@@ -21,14 +22,22 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Setup OCI CLI and try to create VM
-        id: create_vm
-        continue-on-error: true
 
+      # ------------------------------------------------------------
+      # 1. Install OCI CLI
+      # ------------------------------------------------------------
+      - name: Install OCI CLI
         run: |
-          set -o pipefail
-
           python -m pip install --upgrade oci-cli
+          oci --version
+
+
+      # ------------------------------------------------------------
+      # 2. Configure OCI CLI
+      # ------------------------------------------------------------
+      - name: Configure OCI CLI
+        run: |
+          set -e
 
           mkdir -p ~/.oci
 
@@ -46,6 +55,289 @@ jobs:
 
           printf '%s\n' "${{ secrets.SSH_PUBLIC_KEY }}" > /home/runner/my_ssh_key.pub
 
+
+      # ------------------------------------------------------------
+      # 3. Validate OCI resources
+      # ------------------------------------------------------------
+      - name: Validate OCI Configuration
+        id: validate
+        continue-on-error: true
+        run: |
+          set +e
+
+          LOG_FILE="/tmp/oci-validation.log"
+          : > "$LOG_FILE"
+
+          echo "========================================" | tee -a "$LOG_FILE"
+          echo "OCI CONFIGURATION VALIDATION" | tee -a "$LOG_FILE"
+          echo "========================================" | tee -a "$LOG_FILE"
+
+          echo "" | tee -a "$LOG_FILE"
+          echo "Region: ${OCI_CLI_REGION}" | tee -a "$LOG_FILE"
+          echo "Shape: VM.Standard.A1.Flex" | tee -a "$LOG_FILE"
+          echo "Target: 2 OCPU / 12 GB / 200 GB" | tee -a "$LOG_FILE"
+
+          # --------------------------------------------------------
+          # USER TEST
+          # --------------------------------------------------------
+          echo "" | tee -a "$LOG_FILE"
+          echo ">>> TEST 1: USER AUTHENTICATION" | tee -a "$LOG_FILE"
+
+          oci iam user get \
+            --user-id "${OCI_CLI_USER}" \
+            --output json > /tmp/user.json 2>&1
+
+          USER_RC=$?
+
+          if [ $USER_RC -eq 0 ]; then
+            echo "✅ USER: OK" | tee -a "$LOG_FILE"
+          else
+            echo "❌ USER: FAILED" | tee -a "$LOG_FILE"
+            cat /tmp/user.json | tee -a "$LOG_FILE"
+          fi
+
+
+          # --------------------------------------------------------
+          # TENANCY / COMPARTMENT TEST
+          # --------------------------------------------------------
+          echo "" | tee -a "$LOG_FILE"
+          echo ">>> TEST 2: COMPARTMENT" | tee -a "$LOG_FILE"
+
+          oci iam compartment get \
+            --compartment-id "${COMPARTMENT_ID}" \
+            --output json > /tmp/compartment.json 2>&1
+
+          COMPARTMENT_RC=$?
+
+          if [ $COMPARTMENT_RC -eq 0 ]; then
+            echo "✅ COMPARTMENT: OK" | tee -a "$LOG_FILE"
+          else
+            echo "❌ COMPARTMENT: FAILED" | tee -a "$LOG_FILE"
+            cat /tmp/compartment.json | tee -a "$LOG_FILE"
+          fi
+
+
+          # --------------------------------------------------------
+          # AVAILABILITY DOMAIN TEST
+          # --------------------------------------------------------
+          echo "" | tee -a "$LOG_FILE"
+          echo ">>> TEST 3: AVAILABILITY DOMAIN" | tee -a "$LOG_FILE"
+          echo "Requested AD: ${AD_NAME}" | tee -a "$LOG_FILE"
+
+          oci iam availability-domain list \
+            --compartment-id "${COMPARTMENT_ID}" \
+            --output json > /tmp/ad.json 2>&1
+
+          AD_RC=$?
+
+          if [ $AD_RC -eq 0 ]; then
+
+            AD_FOUND=$(python - <<'PY'
+          import json
+
+          try:
+              with open("/tmp/ad.json", "r") as f:
+                  data = json.load(f)
+
+              requested = "${AD_NAME}"
+
+              found = any(
+                  item.get("name") == requested
+                  for item in data.get("data", [])
+              )
+
+              print("true" if found else "false")
+
+          except Exception:
+              print("false")
+          PY
+          )
+
+            if [ "$AD_FOUND" = "true" ]; then
+              echo "✅ AD: FOUND" | tee -a "$LOG_FILE"
+            else
+              echo "❌ AD: NOT FOUND" | tee -a "$LOG_FILE"
+
+              echo "Available ADs:" | tee -a "$LOG_FILE"
+
+              python - <<'PY' | tee -a "$LOG_FILE"
+          import json
+
+          try:
+              with open("/tmp/ad.json", "r") as f:
+                  data = json.load(f)
+
+              for item in data.get("data", []):
+                  print(item.get("name"))
+
+          except Exception as e:
+              print(e)
+          PY
+            fi
+
+          else
+            echo "❌ AD LIST: FAILED" | tee -a "$LOG_FILE"
+            cat /tmp/ad.json | tee -a "$LOG_FILE"
+          fi
+
+
+          # --------------------------------------------------------
+          # IMAGE TEST
+          # --------------------------------------------------------
+          echo "" | tee -a "$LOG_FILE"
+          echo ">>> TEST 4: IMAGE" | tee -a "$LOG_FILE"
+
+          oci compute image get \
+            --image-id "${IMAGE_ID}" \
+            --output json > /tmp/image.json 2>&1
+
+          IMAGE_RC=$?
+
+          if [ $IMAGE_RC -eq 0 ]; then
+            echo "✅ IMAGE: FOUND" | tee -a "$LOG_FILE"
+
+            python - <<'PY' | tee -a "$LOG_FILE"
+          import json
+
+          try:
+              with open("/tmp/image.json", "r") as f:
+                  data = json.load(f)
+
+              d = data.get("data", {})
+
+              print("Image Name:", d.get("display-name"))
+              print("OS:", d.get("operating-system"))
+              print("OS Version:", d.get("operating-system-version"))
+              print("Architecture:", d.get("architecture"))
+
+          except Exception as e:
+              print("Could not read image details:", e)
+          PY
+
+          else
+            echo "❌ IMAGE: FAILED" | tee -a "$LOG_FILE"
+            cat /tmp/image.json | tee -a "$LOG_FILE"
+          fi
+
+
+          # --------------------------------------------------------
+          # SUBNET TEST
+          # --------------------------------------------------------
+          echo "" | tee -a "$LOG_FILE"
+          echo ">>> TEST 5: SUBNET" | tee -a "$LOG_FILE"
+
+          oci network subnet get \
+            --subnet-id "${SUBNET_ID}" \
+            --output json > /tmp/subnet.json 2>&1
+
+          SUBNET_RC=$?
+
+          if [ $SUBNET_RC -eq 0 ]; then
+            echo "✅ SUBNET: FOUND" | tee -a "$LOG_FILE"
+
+            python - <<'PY' | tee -a "$LOG_FILE"
+          import json
+
+          try:
+              with open("/tmp/subnet.json", "r") as f:
+                  data = json.load(f)
+
+              d = data.get("data", {})
+
+              print("Subnet Name:", d.get("display-name"))
+              print("CIDR:", d.get("cidr-block"))
+              print("VCN ID:", d.get("vcn-id"))
+              print("Public IP prohibited:", d.get("prohibit-public-ip-on-vnic"))
+
+          except Exception as e:
+              print("Could not read subnet details:", e)
+          PY
+
+          else
+            echo "❌ SUBNET: FAILED" | tee -a "$LOG_FILE"
+            cat /tmp/subnet.json | tee -a "$LOG_FILE"
+          fi
+
+
+          # --------------------------------------------------------
+          # SHAPE + IMAGE COMPATIBILITY TEST
+          # --------------------------------------------------------
+          echo "" | tee -a "$LOG_FILE"
+          echo ">>> TEST 6: A1 FLEX SHAPE + IMAGE COMPATIBILITY" | tee -a "$LOG_FILE"
+
+          oci compute shape list \
+            --compartment-id "${COMPARTMENT_ID}" \
+            --availability-domain "${AD_NAME}" \
+            --image-id "${IMAGE_ID}" \
+            --shape "VM.Standard.A1.Flex" \
+            --output json > /tmp/shapes.json 2>&1
+
+          SHAPE_RC=$?
+
+          if [ $SHAPE_RC -eq 0 ]; then
+            SHAPE_COUNT=$(python - <<'PY'
+          import json
+
+          try:
+              with open("/tmp/shapes.json", "r") as f:
+                  data = json.load(f)
+
+              print(len(data.get("data", [])))
+
+          except Exception:
+              print("0")
+          PY
+          )
+
+            if [ "$SHAPE_COUNT" -gt 0 ]; then
+              echo "✅ SHAPE: VM.Standard.A1.Flex AVAILABLE FOR THIS IMAGE/AD" | tee -a "$LOG_FILE"
+            else
+              echo "❌ SHAPE: VM.Standard.A1.Flex NOT AVAILABLE FOR THIS IMAGE/AD" | tee -a "$LOG_FILE"
+            fi
+
+          else
+            echo "❌ SHAPE TEST: FAILED" | tee -a "$LOG_FILE"
+            cat /tmp/shapes.json | tee -a "$LOG_FILE"
+          fi
+
+
+          # --------------------------------------------------------
+          # FINAL VALIDATION STATUS
+          # --------------------------------------------------------
+          echo "" | tee -a "$LOG_FILE"
+          echo "========================================" | tee -a "$LOG_FILE"
+          echo "VALIDATION COMPLETE" | tee -a "$LOG_FILE"
+          echo "========================================" | tee -a "$LOG_FILE"
+
+          cp "$LOG_FILE" /tmp/validation-final.log
+
+
+      # ------------------------------------------------------------
+      # 4. Try to launch the VM
+      # ------------------------------------------------------------
+      - name: Try to Create VM
+        id: create_vm
+        continue-on-error: true
+        run: |
+          set +e
+
+          LOG_FILE="/tmp/oci-create.log"
+          : > "$LOG_FILE"
+
+          echo "========================================" | tee -a "$LOG_FILE"
+          echo "OCI ARM VM CREATION ATTEMPT" | tee -a "$LOG_FILE"
+          echo "========================================" | tee -a "$LOG_FILE"
+
+          echo "Region: ${OCI_CLI_REGION}" | tee -a "$LOG_FILE"
+          echo "AD: ${AD_NAME}" | tee -a "$LOG_FILE"
+          echo "Shape: VM.Standard.A1.Flex" | tee -a "$LOG_FILE"
+          echo "OCPU: 2" | tee -a "$LOG_FILE"
+          echo "RAM: 12 GB" | tee -a "$LOG_FILE"
+          echo "Boot Volume: 200 GB" | tee -a "$LOG_FILE"
+
+          echo "" | tee -a "$LOG_FILE"
+          echo "Launching VM..." | tee -a "$LOG_FILE"
+
           OCI_OUTPUT=$(oci compute instance launch \
             --compartment-id "${COMPARTMENT_ID}" \
             --availability-domain "${AD_NAME}" \
@@ -57,51 +349,74 @@ jobs:
             --assign-public-ip true \
             --display-name "arm-free-vm" \
             --boot-volume-size-in-gbs 200 \
-            2>&1 || true)
+            --output json \
+            2>&1)
+
+          OCI_RC=$?
+
+          echo "${OCI_OUTPUT}" | tee -a "$LOG_FILE"
+
+          echo "" | tee -a "$LOG_FILE"
+          echo "OCI exit code: ${OCI_RC}" | tee -a "$LOG_FILE"
 
           {
             echo 'log_data<<EOF'
-            echo "${OCI_OUTPUT}"
+            cat "$LOG_FILE"
             echo 'EOF'
           } >> "${GITHUB_OUTPUT}"
 
-          echo "${OCI_OUTPUT}"
+          if [ $OCI_RC -eq 0 ] && echo "${OCI_OUTPUT}" | grep -q '"lifecycle-state": "PROVISIONING"'; then
 
-          if echo "${OCI_OUTPUT}" | grep -q '"lifecycle-state": "PROVISIONING"'; then
-            echo "VM creation request accepted."
+            echo "✅ SUCCESS: VM creation request accepted." | tee -a "$LOG_FILE"
+
+            echo "success=true" >> "${GITHUB_OUTPUT}"
+
             exit 0
+
           fi
 
-          echo "VM creation did not succeed."
+          echo "❌ VM creation failed." | tee -a "$LOG_FILE"
+
+          echo "success=false" >> "${GITHUB_OUTPUT}"
+
           exit 1
 
+
+      # ------------------------------------------------------------
+      # 5. Discord notification
+      # ------------------------------------------------------------
       - name: Send Discord Notification
         if: always()
-
         uses: sarisia/actions-status-discord@v1.15.4
 
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
 
-          title: "OCI VM Status: ${{ steps.create_vm.outcome }}"
+          title: "OCI ARM VM: ${{ steps.create_vm.outcome }}"
 
           status: ${{ steps.create_vm.outcome }}
 
           color: ${{ steps.create_vm.outcome == 'success' && '0x28a745' || '0xdc3545' }}
 
           description: |
-            Attempt to create VM.Standard.A1.Flex
+            OCI ARM VM attempt
 
             Configuration:
-            2 OCPU / 12 GB RAM / 200 GB Boot Volume
+            2 OCPU
+            12 GB RAM
+            200 GB Boot Volume
 
             Region:
             ${{ secrets.OCI_CLI_REGION }}
 
+            Availability Domain:
+            ${{ secrets.AD_NAME }}
+
             Status:
             ${{ steps.create_vm.outcome }}
 
-            Log Output:
+            Full diagnostic / creation log:
+
             ```text
             ${{ steps.create_vm.outputs.log_data }}
             ```
